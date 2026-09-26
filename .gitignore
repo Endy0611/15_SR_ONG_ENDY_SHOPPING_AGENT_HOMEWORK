@@ -1,0 +1,14 @@
+# Virtual environment
+.venv/
+venv/
+
+# Environment variables (contains your API key)
+.env
+
+# Python
+__pycache__/
+*.pyc
+
+# OS/editor
+.DS_Store
+.vscode/
