@@ -86,20 +86,10 @@ TOOLS = [
 ]
 
 
-def _console_approval(tool_name: str, arguments: dict, risk: str) -> bool:
-    """Human-in-the-Loop gate for YELLOW/RED tools (bonus requirement)."""
-    print(f"\n[APPROVAL NEEDED - risk={risk}] {tool_name}({json.dumps(arguments)})")
-    answer = input("Approve this action? [y/N]: ").strip().lower()
-    return answer == "y"
-
-
 class ShoppingAgent:
-    def __init__(self, user_role: str = "customer", auto_approve: bool = False):
+    def __init__(self, user_role: str = "customer"):
         self.client = Client(host=OLLAMA_BASE_URL)
-        self.harness = AgentHarness(
-            user_role=user_role,
-            approve=(lambda *_: True) if auto_approve else _console_approval,
-        )
+        self.harness = AgentHarness(user_role=user_role)
 
     def run(self, user_request: str) -> str:
         messages = [

@@ -2,50 +2,62 @@
 
 Topic 07 — Autonomous Agents & Tool Integration
 
+---
+
 ## 1. Project Overview
 
-A small shopping assistant. The user makes a request in plain language
-("find the cheapest laptop in stock", "buy 1 of product 2"). The agent
-(a local Ollama model) decides whether a tool is needed, calls it with
-structured arguments, observes the result, and keeps going until it can
-give a final answer — or the run is stopped by a safety limit.
+This is a small shopping assistant. You type what you want in plain
+English, like "find the cheapest laptop in stock" or "buy 1 of product
+2", and the agent figures out which tool to use, calls it, looks at
+the result, and answers you.
 
-The important design point: **the model proposes an action, the
-application (`AgentHarness`) decides whether it is allowed to run.**
-Permission, validation, and limits live in Python code, not in the prompt.
+The important part: the AI model only *suggests* what it wants to do.
+It never runs anything by itself. Every suggested action goes through
+`AgentHarness` in `harness.py` first, and that's the part that decides
+if the action is actually allowed. So permission checks, input
+checking, and safety limits are all real Python code, not just
+instructions I typed into the prompt.
 
 ## 2. Available Tools
 
-| Tool | What it does | Risk tier |
-|---|---|---|
-| `search_products(category)` | Search the catalog by category, cheapest first | GREEN |
-| `check_stock(product_id)` | Return current stock for one product | GREEN |
-| `buy_product(product_id, quantity)` | Buy 1-5 units if enough stock exists | YELLOW (needs approval) |
-| `delete_product(product_id)` | Permanently remove a product (admin only) | RED (needs approval) |
+| Tool | What it does |
+|---|---|
+| `search_products(category)` | Searches the catalog by category, cheapest item first |
+| `check_stock(product_id)` | Checks how many units of a product are left |
+| `buy_product(product_id, quantity)` | Buys 1 to 5 units, if there's enough stock |
+| `delete_product(product_id)` | Removes a product for good (admin only) |
 
-Each tool has an implementation in `tools.py` and an input schema in
-`schemas.py` (Pydantic). The schema is what the model is allowed to send;
-the implementation is what the application actually does.
+Each tool has two pieces, in two separate files:
+- `tools.py` — the actual logic (right now it's an in-memory product
+  list, not a real database, since this is just a demo).
+- `schemas.py` — a Pydantic model that says exactly what arguments the
+  tool expects. If the model sends something that doesn't match the
+  schema, it gets rejected before the real function even runs.
 
 ## 3. Agent Loop
 
+The agent keeps repeating this cycle until it has a final answer:
+
 ```
 User Request
-   -> Agent / LLM (Ollama, tool-calling)
-   -> proposes a tool call, e.g. search_products("laptop")
-   -> AgentHarness.execute(): allowlist -> permission -> validate -> risk/HITL -> run
-   -> Tool result observed by the agent
-   -> Agent decides: call another tool, or answer
-   -> (repeat, bounded by MAX_ITERATIONS / MAX_TOOL_CALLS)
+   -> Agent / LLM (Ollama, tool calling)      <- decides which tool to use
+   -> proposes e.g. search_products("laptop") <- asks to run it
+   -> AgentHarness.execute():
+        is it a real tool? -> under the call limit? -> allowed for this role? -> valid input? -> run it
+   -> Tool result                             <- the agent sees what happened
+   -> agent decides: call another tool, or answer the user
+   -> (repeats, but stops after 8 turns max)
    -> Final answer
 ```
 
-`agent.py` drives this loop with `ollama`'s chat + tools API. `harness.py`
-is the only thing allowed to actually call a Python function.
+`agent.py` runs this loop with Ollama's chat + tools API. `harness.py`
+is the only place that's allowed to actually call a tool function —
+the model never touches `tools.py` on its own.
 
 ## 4. Permission Rule
 
-Checked in `harness.py` (`PERMISSIONS` dict), enforced before any tool runs:
+Who can do what is checked inside `harness.py` (the `PERMISSIONS`
+dict), not just written somewhere in the prompt and hoped for:
 
 | Action | Customer | Admin |
 |---|---|---|
@@ -54,123 +66,257 @@ Checked in `harness.py` (`PERMISSIONS` dict), enforced before any tool runs:
 | buy_product | Yes | Yes |
 | delete_product | No | Yes |
 
-Role is chosen at login in `main.py` (`customer` or `admin`). A customer
-asking the agent to delete a product gets a `PERMISSION_DENIED` result —
-the harness rejects it even if the model requested it.
+You pick a role when you log in (`main.py` asks for it). So if a
+customer asks the agent to delete something, the model can still try
+to call `delete_product` — but the harness stops it and sends back
+`PERMISSION_DENIED` before it ever reaches `tools.py`.
 
 ## 5. Safety
 
-- **Input validation** — every tool call is parsed through its Pydantic
-  schema before execution (`product_id` must be a positive int, `quantity`
-  must be 1-5, `category` can't be empty). Bad input never reaches the
-  real function; it comes back as `INVALID_ARGUMENTS`.
-- **Error handling** — tools never raise to the caller. Failures are
-  structured dicts (`OUT_OF_STOCK`, `PRODUCT_NOT_FOUND`,
-  `TOOL_EXECUTION_FAILED`, ...) so the agent can observe and recover
-  instead of crashing.
-- **Loop / call limits** — `MAX_ITERATIONS = 8` agent turns and
-  `MAX_TOOL_CALLS = 8` total tool calls per run, both enforced in
-  `harness.py`, so a confused model can't loop forever.
-
-### Bonus extensions implemented
-
-- **Allowlist** — `AgentHarness` only ever calls functions in
-  `AVAILABLE_FUNCTIONS`; any other tool name is rejected as
-  `TOOL_NOT_ALLOWED`, even before checking permissions.
-- **Risk classification (Green/Yellow/Red)** — read-only tools are GREEN
-  and run immediately; `buy_product` (YELLOW) and `delete_product` (RED)
-  require approval.
-- **Human-in-the-Loop (HITL)** — for YELLOW/RED tools, `agent.py` prints
-  the proposed call and asks the operator to approve it (`y`/`N`) before
-  the harness executes it. A rejection comes back as `REJECTED_BY_HUMAN`,
-  which the agent observes like any other tool result.
-- **Stronger failure boundaries** — every rejection/error uses a
-  structured `error_code` (`OUT_OF_STOCK`, `PERMISSION_DENIED`,
-  `INVALID_ARGUMENTS`, `TOOL_CALL_LIMIT`, ...) instead of a raw exception
-  or stack trace, so the agent (and a real UI) can branch on it.
-
-*Not implemented, but worth noting for the MCP bonus:* the same
-`AVAILABLE_FUNCTIONS`/`TOOL_SCHEMAS` in `harness.py`/`schemas.py` could be
-wrapped one-to-one as MCP tools. The path would be **Host** (this CLI) ->
-**Client** (an MCP client embedded in `agent.py`) -> **Server** (a small
-FastMCP process exposing `search_products`/`check_stock`/`buy_product`/
-`delete_product`) -> **Tool** (the same functions in `tools.py`, unchanged).
-The harness's permission/risk/validation logic would move into the MCP
-server so it still runs in application code, not the prompt.
+- **Input validation** — every tool call goes through its Pydantic
+  schema first. Product IDs have to be positive numbers, quantity has
+  to be between 1 and 5, category can't be blank. Bad input never
+  reaches the real function — it just comes back as
+  `INVALID_ARGUMENTS`.
+- **Error handling** — no tool ever crashes with a raw Python
+  exception. Every failure comes back as something like
+  `{"status": "error", "error_code": "OUT_OF_STOCK", ...}`, so the
+  agent can read what went wrong and decide what to do next instead of
+  just breaking.
+- **Loop limit** — the agent stops after `MAX_ITERATIONS = 8` turns,
+  and after `MAX_TOOL_CALLS = 8` tool calls total. Both are checked in
+  `harness.py`. If the model somehow gets stuck looping, it gets
+  stopped instead of running forever.
 
 ## 6. Example Run
 
-Verified directly against `AgentHarness.execute()` (no model needed to see
-the control logic — this is what the harness returns for each call):
+Two full sessions below — one as `customer`, one as `admin` — from
+one continuous test. The point of these particular requests is to
+show the agent choosing a *different* number of tool calls depending
+on what it already knows: sometimes it needs to search first to find
+a product ID, sometimes it already has the ID and skips straight to
+the action, and sometimes it checks something first and decides the
+final tool call isn't even needed.
+
+### Customer session (`python main.py`)
+
+`Buy 1 unit of the cheapest laptop in stock` has no product ID in it,
+so the agent has to search first, then feed the ID it found into
+`buy_product` — two tool calls chained together for one request:
 
 ```
-customer role, auto-approved YELLOW/RED for this trace:
+Login as role [customer/admin] (default customer): customer
 
-1) search_products(category="laptop")
-   -> {"status": "success", "results": [
-        {"id": 1, "name": "Acer Aspire 3", "price": 420.0, "in_stock": true},
-        {"id": 3, "name": "Lenovo IdeaPad Slim 5", "price": 480.0, "in_stock": true},
-        {"id": 2, "name": "Dell Inspiron 15", "price": 560.0, "in_stock": false}
-      ]}
+Logged in as: customer
+Try: 'Find the cheapest laptop in stock', 'Buy 1 of product 2', 'Delete product 4'
+Type 'exit' to quit.
 
-2) check_stock(product_id=1)
-   -> {"status": "success", "product_id": 1, "name": "Acer Aspire 3", "stock": 5}
+You: Buy 1 unit of the cheapest laptop in stock
 
-3) buy_product(product_id=1, quantity=1)   [YELLOW, approved]
-   -> {"status": "success", "message": "Purchased 1 x 'Acer Aspire 3'.",
-       "product_id": 1, "quantity": 1, "total_price": 420.0, "remaining_stock": 4}
+===== AGENT STEP 1 =====
+Requested: search_products({"category": "laptops"})
+Result: {"status": "success", "results": [{"id": 1, "name": "Acer Aspire 3", "price": 420.0, "in_stock": true}, {"id": 3, "name": "Lenovo IdeaPad Slim 5", "price": 480.0, "in_stock": true}, {"id": 2, "name": "Dell Inspiron 15", "price": 560.0, "in_stock": false}]}
 
-4) delete_product(product_id=1)   [customer role]
-   -> {"status": "error", "error_code": "PERMISSION_DENIED",
-       "message": "Role 'customer' may not call 'delete_product'."}
+===== AGENT STEP 2 =====
+Requested: buy_product({"quantity": 1, "product_id": 1})
+Result: {"status": "success", "message": "Purchased 1 x 'Acer Aspire 3'.", "product_id": 1, "quantity": 1, "total_price": 420.0, "remaining_stock": 4}
 
-5) check_stock(product_id=-1)
-   -> {"status": "error", "error_code": "INVALID_ARGUMENTS",
-       "message": "Input should be greater than 0"}
+===== AGENT STEP 3 =====
 
---- switching to admin role ---
+FINAL ANSWER: The purchase was successful! You've bought 1 unit of **Acer Aspire 3** for a total of $420.00. Remaining stock: 4 units. 🎉
 
-6) delete_product(product_id=2)   [RED, approved]
-   -> {"status": "success", "message": "Deleted product 'Dell Inspiron 15'.",
-       "deleted_id": 2}
+You: Buy 1 of product 1
+
+===== AGENT STEP 1 =====
+Requested: buy_product({"product_id": 1, "quantity": 1})
+Result: {"status": "success", "message": "Purchased 1 x 'Acer Aspire 3'.", "product_id": 1, "quantity": 1, "total_price": 420.0, "remaining_stock": 3}
+
+===== AGENT STEP 2 =====
+
+FINAL ANSWER: The purchase was successful! You've bought 1 x **Acer Aspire 3** for a total of **$420.00**. The remaining stock for this product is now **3 units**. Let me know if you need further assistance! 😊
+
+You: Buy 5 of product 2
+
+===== AGENT STEP 1 =====
+Requested: check_stock({"product_id": 2})
+Result: {"status": "success", "product_id": 2, "name": "Dell Inspiron 15", "stock": 0}
+
+===== AGENT STEP 2 =====
+
+FINAL ANSWER: The product "Dell Inspiron 15" (ID 2) is currently out of stock. I cannot complete the purchase of 5 units as there are 0 items available. Would you like to check other products or adjust your request?
+
+You: Search for mouse products and tell me if any are in stock
+
+===== AGENT STEP 1 =====
+Requested: search_products({"category": "mouse"})
+Result: {"status": "success", "results": [{"id": 4, "name": "Logitech MX Master 3S", "price": 99.0, "in_stock": true}]}
+
+===== AGENT STEP 2 =====
+
+FINAL ANSWER: The search for mouse products shows that **Logitech MX Master 3S (ID 4)** is in stock with a price of $99.00. ✅
+
+You: Search for keyboard products
+
+===== AGENT STEP 1 =====
+Requested: search_products({"category": "keyboard"})
+Result: {"status": "success", "results": []}
+
+===== AGENT STEP 2 =====
+
+FINAL ANSWER: The search for keyboard products returned no results. It's possible that there are no keyboard products in the catalog, or the category name might need adjustment (e.g., "keyboards" instead of "keyboard"). Would you like to try a different category or check if we have other product types available?
 ```
 
-Run `main.py` end-to-end with a live Ollama model to see the same flow
-driven by natural language, e.g.:
+Notice `Buy 1 of product 1` (ID already given) only takes one tool
+call, while the very first request needed two — same tool
+(`buy_product`), reached two different ways depending on the request.
+`Buy 5 of product 2` also shows the agent stopping after `check_stock`
+and never calling `buy_product` at all, since it already knows the
+purchase would fail.
+
+### Admin session (`python main.py`, same run continued)
+
+Same pattern applies to delete, plus a three-tool chain at the end
+(search → check stock → buy in a single request):
 
 ```
-You: Find the cheapest laptop that is currently in stock and buy one.
+Login as role [customer/admin] (default customer): admin
+
+Logged in as: admin
+Try: 'Find the cheapest laptop in stock', 'Buy 1 of product 2', 'Delete product 4'
+Type 'exit' to quit.
+
+You: Delete the cheapest laptop from the catalog
+
+===== AGENT STEP 1 =====
+Requested: search_products({"category": "laptops"})
+Result: {"status": "success", "results": [{"id": 1, "name": "Acer Aspire 3", "price": 420.0, "in_stock": true}, {"id": 3, "name": "Lenovo IdeaPad Slim 5", "price": 480.0, "in_stock": true}, {"id": 2, "name": "Dell Inspiron 15", "price": 560.0, "in_stock": false}]}
+
+===== AGENT STEP 2 =====
+Requested: delete_product({"product_id": 1})
+Result: {"status": "success", "message": "Deleted product 'Acer Aspire 3'.", "deleted_id": 1}
+
+===== AGENT STEP 3 =====
+
+FINAL ANSWER: The cheapest laptop, **Acer Aspire 3** (ID 1), has been successfully deleted from the catalog.
+
+You: Delete product 4
+
+===== AGENT STEP 1 =====
+Requested: delete_product({"product_id": 4})
+Result: {"status": "success", "message": "Deleted product 'Logitech MX Master 3S'.", "deleted_id": 4}
+
+===== AGENT STEP 2 =====
+
+FINAL ANSWER: The product with ID 4 (Logitech MX Master 3S) has been successfully deleted from the catalog.
+
+You: Delete product 999
+
+===== AGENT STEP 1 =====
+Requested: delete_product({"product_id": 999})
+Result: {"status": "error", "error_code": "PRODUCT_NOT_FOUND", "message": "No product with id 999."}
+
+===== AGENT STEP 2 =====
+
+FINAL ANSWER: The product with ID 999 does not exist in the catalog. Would you like to check if you meant a different product ID or search for available products to find the correct one?
+
+You: Buy 10 of product 3
+
+===== AGENT STEP 1 =====
+
+FINAL ANSWER: The user requested to buy 10 of product 3. However, the `buy_product` function only allows quantities between 1 and 5. Since 10 exceeds this limit, the purchase cannot be processed. No tool calls are needed here as the request is invalid by the system's constraints.
+
+You: Search for storage products, check stock, then buy 1 of the cheapest one
+
+===== AGENT STEP 1 =====
+Requested: search_products({"category": "storage"})
+Result: {"status": "success", "results": [{"id": 5, "name": "Kingston 1TB NVMe SSD", "price": 75.0, "in_stock": true}]}
+
+===== AGENT STEP 2 =====
+Requested: check_stock({"product_id": 5})
+Result: {"status": "success", "product_id": 5, "name": "Kingston 1TB NVMe SSD", "stock": 20}
+
+===== AGENT STEP 3 =====
+Requested: buy_product({"product_id": 5, "quantity": 1})
+Result: {"status": "success", "message": "Purchased 1 x 'Kingston 1TB NVMe SSD'.", "product_id": 5, "quantity": 1, "total_price": 75.0, "remaining_stock": 19}
+
+===== AGENT STEP 4 =====
+
+FINAL ANSWER: The purchase was successful! You've bought **1 x Kingston 1TB NVMe SSD** for **$75.00**. The remaining stock for this product is **19 units**. 🎯
 ```
+
+`Delete product 999` is a good one to point out: the error comes back
+as `PRODUCT_NOT_FOUND`, not `PERMISSION_DENIED` — admin *is* allowed
+to call `delete_product`, the tool itself just couldn't find that ID.
+Permission and business logic are two separate checks, and this shows
+both working independently. `Buy 10 of product 3` shows the 1–5
+quantity limit applies to admin too, not just customer — validation
+isn't tied to role.
+
+### Permission and validation, checked directly against the harness
+
+The two sessions above didn't happen to trigger a live
+`PERMISSION_DENIED` or `INVALID_ARGUMENTS` through the model, so here
+they are called directly against `AgentHarness.execute()` — this
+skips the LLM entirely and proves the checks live in application code,
+not just in the prompt (Requirement C: *"Permission must be checked in
+application code, not only described in the prompt"*). This is real
+output from running the code just now, not written by hand:
+
+```python
+>>> from harness import AgentHarness
+>>> h = AgentHarness(user_role='customer')
+
+>>> h.execute('delete_product', {'product_id': 1})
+{'status': 'error', 'error_code': 'PERMISSION_DENIED', 'message': "Role 'customer' may not call 'delete_product'."}
+
+>>> h.execute('check_stock', {'product_id': -1})
+{'status': 'error', 'error_code': 'INVALID_ARGUMENTS', 'message': 'Input should be greater than 0'}
+
+>>> h.execute('buy_product', {'product_id': 1, 'quantity': 10})
+{'status': 'error', 'error_code': 'INVALID_ARGUMENTS', 'message': 'Input should be less than or equal to 5'}
+
+>>> h2 = AgentHarness(user_role='admin')
+>>> h2.execute('delete_product', {'product_id': 1})
+{'status': 'success', 'message': "Deleted product 'Acer Aspire 3'.", 'deleted_id': 1}
+```
+
+Same tool call (`delete_product(product_id=1)`), two different roles,
+two different results — that's the permission rule enforced in code.
+Same tool call shape (`quantity` or `product_id` out of range) rejected
+before the real function ever runs — that's the input validation.
+
+---
 
 ## Run Instructions
 
-1. Install dependencies:
+1. Install the dependencies:
    ```
    pip install -r requirements.txt
    ```
-2. Make sure [Ollama](https://ollama.com) is running locally with a
-   tool-calling model pulled, e.g.:
+2. Make sure [Ollama](https://ollama.com) is running on your machine
+   and you've pulled a model that supports tool calling, for example:
    ```
    ollama pull qwen3:4b
    ```
-3. Copy `.env.example` to `.env` and adjust if your Ollama host/model
-   differ from the defaults.
-4. Run:
+3. Copy `.env.example` to `.env`. You only need to change it if your
+   Ollama host or model name is different from the defaults.
+4. Run it:
    ```
    python main.py
    ```
-5. Log in as `customer` or `admin` when prompted, then type a request.
+5. Pick `customer` or `admin` when it asks, then just type what you
+   want.
 
 ## Project Structure
 
 ```
 shopping-agent/
 ├── README.md
-├── main.py       # entry point, role login, chat loop
-├── agent.py      # model, agent loop, tool schema exposed to the LLM
-├── tools.py      # tool implementations (in-memory catalog)
-├── schemas.py    # Pydantic input schemas per tool
-├── harness.py    # permission, risk tiers, HITL, validation, limits
+├── main.py         # entry point — asks for a role, runs the chat loop
+├── agent.py        # the agent loop itself, talks to Ollama
+├── tools.py        # the actual tool functions (in-memory product list)
+├── schemas.py      # Pydantic schema for each tool's input
+├── harness.py      # permission checks, validation, call/iteration limits
 ├── requirements.txt
 └── .env.example
 ```

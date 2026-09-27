@@ -22,10 +22,19 @@ _PRODUCTS: dict[int, dict] = {
 _PURCHASES: list[dict] = []
 
 
+def _normalize_category(category: str) -> str:
+    """Lowercase and strip a trailing 's' so 'laptop' and 'laptops' match."""
+    normalized = category.strip().lower()
+    if len(normalized) > 1 and normalized.endswith("s"):
+        normalized = normalized[:-1]
+    return normalized
+
+
 def search_products(category: str) -> dict:
-    """Search products by category, cheapest first."""
+    """Search products by category, cheapest first. Matches singular/plural."""
+    target = _normalize_category(category)
     matches = sorted(
-        (p for p in _PRODUCTS.values() if p["category"] == category.lower()),
+        (p for p in _PRODUCTS.values() if _normalize_category(p["category"]) == target),
         key=lambda p: p["price"],
     )
     return {
